@@ -1,7 +1,5 @@
 """
-Kestrel Cloud GCP — Compute Engine GPU management.
-
-Extracted from kestrel-sovereign as a standalone cloud provider package.
+GCP Compute Engine GPU management for Kestrel.
 
 Modular structure for the GCP Compute Engine GPU instance manager:
 - models.py: Data models, enums, exceptions
