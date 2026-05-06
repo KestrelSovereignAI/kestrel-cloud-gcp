@@ -65,3 +65,9 @@ packages = ["kestrel_cloud_gcp"]
 
 [tool.hatch.build.targets.sdist]
 include = ["kestrel_cloud_gcp/**/*", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "cloud_resource: tests that touch real cloud (GCP creds required)",
+]
