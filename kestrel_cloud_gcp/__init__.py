@@ -1,12 +1,11 @@
-"""
-Kestrel Cloud GCP — GCP Compute Engine + Cloud Run providers.
+"""Kestrel Cloud GCP — GCP Compute Engine provider for Kestrel Sovereign.
 
-Extracted from kestrel-sovereign as a standalone cloud provider package.
-Registers GCPComputeFeature via ``kestrel_sovereign.features`` and
-CloudRunProvider via ``kestrel_sovereign.cloud_providers``.
+Extracted from kestrel-sovereign as a standalone cloud-provider package.
+Registers ``GCPComputeFeature`` via the ``kestrel_sovereign.features``
+entry-point group; auto-discovered when installed alongside
+kestrel-sovereign.
 """
 
-from .cloudrun import CloudRunProvider
 from .compute import (
     GCPComputeEngineManager,
     GCPComputeManager,
@@ -15,9 +14,10 @@ from .compute import (
     GPUProfile,
     InstanceStatus,
 )
+from .compute.feature import GCPComputeFeature
 
 __all__ = [
-    "CloudRunProvider",
+    "GCPComputeFeature",
     "GCPComputeEngineManager",
     "GCPComputeManager",
     "GCPComputeManagerError",

@@ -1,29 +1,67 @@
 [project]
 name = "kestrel-cloud-gcp"
 version = "0.1.0"
-description = "GCP Compute Engine and Cloud Run cloud providers for Kestrel Sovereign"
+description = "GCP Compute Engine provider for Kestrel Sovereign — provision GPU instances, run training jobs, lifecycle management"
+readme = "README.md"
 requires-python = ">=3.11,<3.14"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "UncleSaurus" }]
+maintainers = [{ name = "UncleSaurus" }]
+keywords = [
+    "ai",
+    "agents",
+    "kestrel",
+    "gcp",
+    "google-cloud",
+    "compute-engine",
+    "gpu",
+    "lora",
+    "training",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Distributed Computing",
+]
 dependencies = [
-    "kestrel-sovereign-sdk @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk.git",
-    # Cross-feature: llm.service, config (not in SDK)
-    "kestrel-sovereign @ git+https://github.com/KestrelSovereignAI/kestrel-sovereign.git",
+    "kestrel-sovereign-sdk>=0.2,<1",
+    # Framework runtime dep: feature uses kestrel_sovereign.config.load_config
+    # to honor the unified-kestrel.toml [gcp_compute] section. SDK doesn't
+    # expose this (framework-specific behavior).
+    "kestrel-sovereign>=0.5,<1",
     "google-cloud-compute>=1.15.0",
-    "google-cloud-run>=0.10.0",
     "google-cloud-logging>=3.5.0",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=1.1.0",
+]
+
+[project.urls]
+Homepage = "https://kestrelsovereign.com"
+Source = "https://github.com/KestrelSovereignAI/kestrel-cloud-gcp"
+Issues = "https://github.com/KestrelSovereignAI/kestrel-cloud-gcp/issues"
+
 [project.entry-points."kestrel_sovereign.features"]
 GCPComputeFeature = "kestrel_cloud_gcp.compute.feature:GCPComputeFeature"
-
-[project.entry-points."kestrel_sovereign.cloud_providers"]
-CloudRunProvider = "kestrel_cloud_gcp.cloudrun:CloudRunProvider"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.hatch.metadata]
-allow-direct-references = true
-
 [tool.hatch.build.targets.wheel]
 packages = ["kestrel_cloud_gcp"]
+
+[tool.hatch.build.targets.sdist]
+include = ["kestrel_cloud_gcp/**/*", "README.md", "LICENSE", "pyproject.toml"]

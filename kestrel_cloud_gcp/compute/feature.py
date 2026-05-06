@@ -10,14 +10,13 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from kestrel_sdk.features.base import Feature, tool
-from kestrel_sovereign.llm.service import BackendType
-from kestrel_sdk.tools.base import ToolCategory
-
-from .manager import GCPComputeEngineManager as GCPComputeManager
-from .models import (
+from kestrel_cloud_gcp.compute.manager import GCPComputeEngineManager as GCPComputeManager
+from kestrel_cloud_gcp.compute.models import (
     GCPComputeManagerError,
     InstanceStatus,
 )
+from kestrel_sdk.llm.types import BackendType
+from kestrel_sdk.tools.base import ToolCategory
 
 logger = logging.getLogger(__name__)
 
