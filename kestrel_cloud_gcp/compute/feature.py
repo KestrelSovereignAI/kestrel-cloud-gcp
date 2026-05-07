@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from kestrel_sdk.features.base import Feature, tool
+from kestrel_sdk.tools.result import ToolResult
 from kestrel_cloud_gcp.compute.manager import GCPComputeEngineManager as GCPComputeManager
 from kestrel_cloud_gcp.compute.models import (
     GCPComputeManagerError,
@@ -52,7 +53,7 @@ class GCPComputeFeature(Feature):
         model_name: str = "",
         ttl_seconds: str = "",
         use_spot: str = "true",
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Main entry point for GCP Compute instance management.
 
@@ -93,13 +94,14 @@ class GCPComputeFeature(Feature):
         if action_normalized in {"disks"}:
             return await self._list_disks()
 
-        return {
-            "success": False,
-            "error": f"Unknown action: {action}",
-            "available_actions": ["status", "on", "off", "list", "disks"],
-        }
+        return ToolResult.failed(
+            f"Unknown action: {action}",
+            data={
+                "available_actions": ["status", "on", "off", "list", "disks"],
+            },
+        )
 
-    async def _status(self) -> Dict[str, Any]:
+    async def _status(self) -> ToolResult:
         """Get current session status."""
         try:
             status = await self.manager.get_status()
@@ -116,10 +118,13 @@ class GCPComputeFeature(Feature):
                     elapsed_hours = elapsed_seconds / 3600
                     status["estimated_cost"] = f"${elapsed_hours * cost_per_hr:.4f}"
 
-            return status
+            return ToolResult.ok(
+                confirmation=f"GCP session status: {status.get('status', 'unknown')}",
+                data=status,
+            )
 
         except GCPComputeManagerError as e:
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
 
     async def _start(
         self,
@@ -127,16 +132,17 @@ class GCPComputeFeature(Feature):
         model_name: str = "",
         ttl_seconds: str = "",
         use_spot: bool = True,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """Start a new GPU instance."""
         if not profile_name:
             profiles = list(self.manager.profiles.keys())
-            return {
-                "success": False,
-                "error": "Profile required",
-                "available_profiles": profiles,
-                "usage": "!gcp on profile=training",
-            }
+            return ToolResult.failed(
+                "Profile required",
+                data={
+                    "available_profiles": profiles,
+                    "usage": "!gcp on profile=training",
+                },
+            )
 
         try:
             ttl = self._coerce_optional_int(ttl_seconds)
@@ -171,12 +177,19 @@ class GCPComputeFeature(Feature):
                     logger.warning(f"Failed to register with LLM router: {e}", exc_info=True)
                     result["llm_routing"] = f"failed: {e}"
 
-            return {"success": True, **result}
+            instance_name = result.get("instance_name", "")
+            return ToolResult.ok(
+                confirmation=(
+                    f"Started GCP instance{f' {instance_name}' if instance_name else ''} "
+                    f"(profile: {profile_name})"
+                ),
+                data=result,
+            )
 
         except GCPComputeManagerError as e:
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
 
-    async def _stop(self) -> Dict[str, Any]:
+    async def _stop(self) -> ToolResult:
         """Stop the current instance."""
         try:
             # Unregister from LLM router
@@ -189,40 +202,47 @@ class GCPComputeFeature(Feature):
                     logger.warning(f"Failed to unregister from LLM router: {e}", exc_info=True)
 
             result = await self.manager.stop_session()
-            return {"success": True, **result}
+            return ToolResult.ok(
+                confirmation="Stopped GCP session",
+                data=result,
+            )
 
         except GCPComputeManagerError as e:
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
 
-    async def _list_instances(self) -> Dict[str, Any]:
+    async def _list_instances(self) -> ToolResult:
         """List all Kestrel instances in the project."""
         try:
             instances = await self.manager.list_instances()
-            return {
-                "success": True,
-                "instances": instances,
-                "count": len(instances),
-            }
+            return ToolResult.ok(
+                confirmation=f"Listed {len(instances)} GCP instance(s)",
+                data={
+                    "instances": instances,
+                    "count": len(instances),
+                },
+            )
         except (KeyError, ValueError) as e:
-            return {"success": False, "error": f"Invalid instance data: {e}"}
+            return ToolResult.failed(f"Invalid instance data: {e}")
         except Exception as e:
             logger.error(f"Unexpected error listing instances: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
 
-    async def _list_disks(self) -> Dict[str, Any]:
+    async def _list_disks(self) -> ToolResult:
         """List all Kestrel persistent disks."""
         try:
             disks = await self.manager.list_disks()
-            return {
-                "success": True,
-                "disks": disks,
-                "count": len(disks),
-            }
+            return ToolResult.ok(
+                confirmation=f"Listed {len(disks)} GCP persistent disk(s)",
+                data={
+                    "disks": disks,
+                    "count": len(disks),
+                },
+            )
         except (KeyError, ValueError) as e:
-            return {"success": False, "error": f"Invalid disk data: {e}"}
+            return ToolResult.failed(f"Invalid disk data: {e}")
         except Exception as e:
             logger.error(f"Unexpected error listing disks: {e}", exc_info=True)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
 
     def _coerce_optional_int(self, value: str) -> Optional[int]:
         """Convert string to int, returning None if empty or invalid."""
