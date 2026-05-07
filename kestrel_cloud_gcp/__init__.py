@@ -6,6 +6,8 @@ entry-point group; auto-discovered when installed alongside
 kestrel-sovereign.
 """
 
+from importlib.metadata import PackageNotFoundError, version as _version
+
 from .compute import (
     GCPComputeEngineManager,
     GCPComputeManager,
@@ -16,6 +18,11 @@ from .compute import (
 )
 from .compute.feature import GCPComputeFeature
 
+try:
+    __version__ = _version("kestrel-cloud-gcp")
+except PackageNotFoundError:
+    __version__ = "0.0.0+local"
+
 __all__ = [
     "GCPComputeFeature",
     "GCPComputeEngineManager",
@@ -24,4 +31,5 @@ __all__ = [
     "GCPComputeSession",
     "GPUProfile",
     "InstanceStatus",
+    "__version__",
 ]
