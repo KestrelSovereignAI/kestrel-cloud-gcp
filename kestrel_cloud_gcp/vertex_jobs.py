@@ -8,7 +8,10 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from google.auth.credentials import Credentials
 
 VERTEX_OPERATION_LABEL = "kestrel_operation_sha256"
 _NUMBER = re.compile(r"[1-9][0-9]{0,19}")
@@ -319,6 +322,146 @@ def find_vertex_custom_job(
         seen_tokens.add(token)
         query["pageToken"] = token
     raise VertexJobObservationError("Vertex search did not complete within its page bound")
+
+
+class VertexJobEffectUnresolvedError(VertexJobObservationError):
+    """A write might have reached Vertex. Read the original, never replay create."""
+
+
+class _VertexSubmissionExpired(VertexJobObservationError):
+    """Credential preparation elapsed before any job request was sent."""
+
+
+class VertexCustomJobClient:
+    """Stateless regional v1 transport; the caller owns durable write admission.
+
+    Use one create only after persisting the exact plan. After any ambiguous
+    result, recover by operation label with `find`; an absent job proves
+    neither rejection nor authorization to send another create.
+    """
+
+    def __init__(self, credentials: Credentials):
+        from google.auth.transport.requests import Request
+        from requests import Session
+
+        self._credentials = credentials
+        self._auth_session = Session()
+        self._auth_request = Request(session=self._auth_session)
+        self._session = Session()
+        # A netrc entry must not replace the prepared Google workload identity.
+        self._session.trust_env = False
+
+    @classmethod
+    def from_adc(cls) -> VertexCustomJobClient:
+        """Use application-default workload identity, not a supplied raw token."""
+        import google.auth
+
+        credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        return cls(credentials)
+
+    def __enter__(self) -> VertexCustomJobClient:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        try:
+            self._session.close()
+        finally:
+            self._auth_session.close()
+
+    def _request(
+        self, method: str, url: str, *,
+        params: Mapping[str, str] | None = None, body: Mapping[str, Any] | None = None,
+        submit_before: datetime | None = None,
+    ) -> Mapping[str, Any]:
+        from google.auth.exceptions import GoogleAuthError
+        from requests import Request, RequestException
+
+        try:
+            headers: dict[str, str] = {}
+            self._credentials.before_request(self._auth_request, method, url, headers)
+            request = self._session.prepare_request(Request(
+                method, url, headers=headers, json=body, params=params,
+            ))
+            # Refresh can block. Check the original admission after preparing
+            # the request, at the transport handoff, rather than trusting the
+            # earlier payload construction. There is no retry on 401/redirect.
+            if submit_before is not None and datetime.now(UTC) >= submit_before:
+                raise _VertexSubmissionExpired("Vertex submission window elapsed before transport")
+            with self._session.send(
+                request, timeout=(5, 20), allow_redirects=False,
+            ) as response:
+                if not 200 <= response.status_code < 300:
+                    raise VertexJobObservationError(
+                        f"Vertex {method} did not succeed (HTTP {response.status_code})"
+                    )
+                payload = response.json()
+        except (GoogleAuthError, RequestException):
+            raise VertexJobObservationError(f"Vertex {method} transport did not return an observation") from None
+        if not isinstance(payload, Mapping):
+            raise VertexJobObservationError(f"Vertex {method} did not return an object")
+        return payload
+
+    def create(self, plan: VertexCustomJobPlan) -> VertexCustomJobObservation:
+        body = plan.create_payload(now=datetime.now(UTC))
+        try:
+            return plan.observe_create_response(self._request(
+                "POST", plan.create_url, body=body, submit_before=plan.submit_before,
+            ))
+        except _VertexSubmissionExpired:
+            raise
+        except VertexJobObservationError:
+            raise VertexJobEffectUnresolvedError(
+                "Vertex create is unconfirmed; search only for the original operation label"
+            ) from None
+
+    def find(
+        self, location: VertexCustomJobLocation, operation_sha256: str,
+    ) -> VertexCustomJobObservation | None:
+        return find_vertex_custom_job(
+            lambda url, params: self._request("GET", url, params=params),
+            location=location, operation_sha256=operation_sha256,
+        )
+
+    def get(
+        self, locator: VertexCustomJobLocator, operation_sha256: str,
+    ) -> VertexCustomJobObservation:
+        vertex_operation_label_value(operation_sha256)
+        payload = self._request("GET", locator.get_url, params={
+            "fields": "name,labels,state,createTime,startTime,endTime",
+        })
+        return VertexCustomJobObservation.from_readback(
+            payload, locator=locator, expected_operation_sha256=operation_sha256,
+        )
+
+    def cancel(
+        self, locator: VertexCustomJobLocator, operation_sha256: str,
+    ) -> VertexCustomJobObservation:
+        """Attempt one cancellation and require exact terminal readback.
+
+        An already-terminal job is returned as-is (including success). A
+        cancelled reply or failed transport is never itself evidence of the
+        job's outcome; check the original identity again through `get`.
+        """
+        current = self.get(locator, operation_sha256)
+        if current.state in _END_EVIDENCE_REQUIRED:
+            return current
+        if current.state is not VertexCustomJobState.CANCELLING:
+            try:
+                self._request("POST", locator.get_url + ":cancel", body={})
+            except VertexJobObservationError:
+                # The same readback is required whether the acknowledgment
+                # was successful, rejected, or lost after the write.
+                pass
+        try:
+            observed = self.get(locator, operation_sha256)
+        except VertexJobObservationError:
+            observed = None
+        if observed is None or observed.state not in _END_EVIDENCE_REQUIRED:
+            raise VertexJobEffectUnresolvedError("Vertex cancellation has no exact terminal readback")
+        return observed
 
 
 def _timestamp(value: Any) -> tuple[datetime, int] | None:

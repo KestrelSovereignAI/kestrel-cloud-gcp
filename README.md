@@ -32,7 +32,7 @@ prefer_spot = true
 - Standalone API: `GCPComputeEngineManager` for direct programmatic use
 - Spot-instance preference + automatic lifecycle (TTL, budget caps)
 
-### Vertex Custom Job recovery
+### Vertex Custom Job admission and recovery
 
 `kestrel_cloud_gcp.vertex_jobs` offers read-only helpers for US Vertex AI v1
 Custom Jobs. Bind the original dispatch digest with `vertex_operation_label_value`
@@ -40,8 +40,16 @@ and use `find_vertex_custom_job` with an authenticated GET callback to recover
 the exact job after a lost submit response. The search rejects multiple matches,
 foreign identities, and incomplete pages. An empty result never authorizes a
 repeat submission. Verify subsequent status with the exact job URL and
-`VertexCustomJobObservation.from_readback`. The helpers do not submit or cancel
-jobs and never retain trainer arguments or artifacts.
+`VertexCustomJobObservation.from_readback`.
+
+`VertexCustomJobClient.from_adc()` uses Google Application Default Credentials
+to submit an already-persisted `VertexCustomJobPlan` through the regional v1
+API. It does not replay a create, follow redirects, or treat an acknowledged
+cancel as proof. Persist the exact job identity or recover it by operation
+label; cancel only that identity and verify terminal state through readback.
+The caller owns spend admission, queue and execution deadlines, reconciliation,
+and catalog artifact custody. The adapter does not retain trainer arguments,
+outputs, or raw provider error bodies.
 
 `VertexCustomJobPlan` prepares the US v1 request for one GPU container
 without sending it. The image must be digest-pinned in regional Artifact
