@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from google.auth.credentials import Credentials
 
 VERTEX_OPERATION_LABEL = "kestrel_operation_sha256"
+VERTEX_OPERATION_ENV = "KESTREL_VERTEX_OPERATION_SHA256"
 _NUMBER = re.compile(r"[1-9][0-9]{0,19}")
 _US_REGION = re.compile(r"us-[a-z]+[0-9]+")
 _SHA256 = re.compile(r"[a-f0-9]{64}")
@@ -202,7 +203,12 @@ class VertexCustomJobPlan:
                         "acceleratorType": self.accelerator_type,
                         "acceleratorCount": 1,
                     },
-                    "containerSpec": {"imageUri": self.image_uri},
+                    "containerSpec": {
+                        "imageUri": self.image_uri,
+                        # The same digest as the management label, in its
+                        # original representation. It is not a bearer grant.
+                        "env": [{"name": VERTEX_OPERATION_ENV, "value": self.operation_sha256}],
+                    },
                 }],
             },
         }
