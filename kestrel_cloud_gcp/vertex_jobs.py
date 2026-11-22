@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from base64 import b32encode
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -66,6 +67,28 @@ class VertexCustomJobState(StrEnum):
     PARTIALLY_SUCCEEDED = "JOB_STATE_PARTIALLY_SUCCEEDED"
 
 
+_START_EVIDENCE_REQUIRED = frozenset({
+    VertexCustomJobState.RUNNING,
+    VertexCustomJobState.UPDATING,
+    VertexCustomJobState.SUCCEEDED,
+    VertexCustomJobState.PARTIALLY_SUCCEEDED,
+})
+_END_EVIDENCE_REQUIRED = frozenset({
+    VertexCustomJobState.SUCCEEDED,
+    VertexCustomJobState.FAILED,
+    VertexCustomJobState.CANCELLED,
+    VertexCustomJobState.EXPIRED,
+    VertexCustomJobState.PARTIALLY_SUCCEEDED,
+})
+
+
+def vertex_operation_label_value(operation_sha256: str) -> str:
+    """Losslessly encode a digest below Google's 63-character label limit."""
+    if not isinstance(operation_sha256, str) or not _SHA256.fullmatch(operation_sha256):
+        raise VertexJobObservationError("Invalid original Vertex operation digest")
+    return b32encode(bytes.fromhex(operation_sha256)).decode("ascii").rstrip("=").lower()
+
+
 @dataclass(frozen=True, slots=True)
 class VertexCustomJobObservation:
     """Provider timestamps and state, not artifact, cost, or cleanup authority."""
@@ -85,17 +108,14 @@ class VertexCustomJobObservation:
         locator: VertexCustomJobLocator,
         expected_operation_sha256: str,
     ) -> VertexCustomJobObservation:
-        if not isinstance(expected_operation_sha256, str) or not _SHA256.fullmatch(
-            expected_operation_sha256
-        ):
-            raise VertexJobObservationError("Invalid original Vertex operation digest")
+        expected_label = vertex_operation_label_value(expected_operation_sha256)
         if not isinstance(payload, Mapping):
             raise VertexJobObservationError("Invalid Vertex readback object")
         labels = payload.get("labels")
         if (
             payload.get("name") != locator.resource_name
             or not isinstance(labels, Mapping)
-            or labels.get(VERTEX_OPERATION_LABEL) != expected_operation_sha256
+            or labels.get(VERTEX_OPERATION_LABEL) != expected_label
         ):
             raise VertexJobObservationError("Vertex readback does not bind the original job")
 
@@ -108,15 +128,9 @@ class VertexCustomJobObservation:
         ended_at = _timestamp(payload.get("endTime"))
         if created_at is None:
             raise VertexJobObservationError("Vertex readback lacks its create timestamp")
-        if state in {
-            VertexCustomJobState.RUNNING, VertexCustomJobState.UPDATING,
-            VertexCustomJobState.SUCCEEDED,
-        } and started_at is None:
+        if state in _START_EVIDENCE_REQUIRED and started_at is None:
             raise VertexJobObservationError("Vertex readback lacks its start timestamp")
-        if state in {
-            VertexCustomJobState.SUCCEEDED, VertexCustomJobState.FAILED,
-            VertexCustomJobState.CANCELLED,
-        } and ended_at is None:
+        if state in _END_EVIDENCE_REQUIRED and ended_at is None:
             raise VertexJobObservationError("Vertex readback lacks its end timestamp")
         if (
             (started_at is not None and started_at < created_at)
