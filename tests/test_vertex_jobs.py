@@ -1,7 +1,9 @@
 """Vertex v1 Custom Job evidence and exact identity contract."""
 
 from base64 import b32decode
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -10,6 +12,7 @@ from kestrel_cloud_gcp.vertex_jobs import (
     VertexCustomJobLocation,
     VertexCustomJobLocator,
     VertexCustomJobObservation,
+    VertexCustomJobPlan,
     VertexCustomJobState,
     VertexJobObservationError,
     find_vertex_custom_job,
@@ -196,3 +199,86 @@ def test_vertex_search_rejects_invalid_bounds_before_transport():
         find_vertex_custom_job(
             forbidden, location=LOCATION, operation_sha256=DIGEST, max_pages=True
         )
+
+
+@pytest.fixture
+def bounded_plan():
+    now = datetime(2026, 11, 22, 16, 59, tzinfo=UTC)
+    return VertexCustomJobPlan(
+        location=LOCATION, operation_sha256=DIGEST,
+        worker_service_account="lora-worker@training-project.iam.gserviceaccount.com",
+        image_uri="us-central1-docker.pkg.dev/training-project/worker/sdxl@sha256:" + "a" * 64,
+        machine_type="g2-standard-8", accelerator_type="NVIDIA_L4",
+        max_run_seconds=1800, submit_before=now + timedelta(seconds=60),
+        hard_deadline=now + timedelta(seconds=3600),
+    )
+
+
+def test_create_payload_has_one_pinned_worker_explicit_deadline_and_no_ambient_credentials(bounded_plan):
+    now = bounded_plan.submit_before - timedelta(seconds=1)
+    wire = bounded_plan.create_payload(now=now)
+    assert bounded_plan.create_url == LOCATION.list_url
+    assert wire["labels"] == {VERTEX_OPERATION_LABEL: vertex_operation_label_value(DIGEST)}
+    assert wire["jobSpec"] == {
+        "serviceAccount": bounded_plan.worker_service_account,
+        "enableWebAccess": False, "enableDashboardAccess": False,
+        "scheduling": {
+            "timeout": "1800s", "disableRetries": True, "restartJobOnWorkerRestart": False,
+        },
+        "workerPoolSpecs": [{
+            "replicaCount": "1",
+            "machineSpec": {
+                "machineType": "g2-standard-8", "acceleratorType": "NVIDIA_L4",
+                "acceleratorCount": 1,
+            },
+            "containerSpec": {"imageUri": bounded_plan.image_uri},
+        }],
+    }
+    wire["jobSpec"]["workerPoolSpecs"].clear()
+    assert len(bounded_plan.create_payload(now=now)["jobSpec"]["workerPoolSpecs"]) == 1
+
+
+def test_plan_refuses_late_submit_and_binds_ack_to_original_operation(bounded_plan):
+    with pytest.raises(VertexJobObservationError, match="window has elapsed"):
+        bounded_plan.create_payload(now=bounded_plan.submit_before)
+    assert bounded_plan.observe_create_response(payload()) == read(payload())
+    for foreign in (payload(labels={}), payload(name="projects/2/locations/us-east1/customJobs/1")):
+        with pytest.raises(VertexJobObservationError):
+            bounded_plan.observe_create_response(foreign)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"location": JOB},
+        {"image_uri": "us-central1-docker.pkg.dev/training-project/worker/sdxl:latest"},
+        {"image_uri": "europe-west3-docker.pkg.dev/training-project/worker/sdxl@sha256:" + "a" * 64},
+        {"worker_service_account": "person@example.test"},
+        {"max_run_seconds": True},
+        {"max_run_seconds": 0},
+        {"max_run_seconds": 5000},
+        {"accelerator_type": "TPU_PAUSE"},
+        {"accelerator_type": "NVIDIA_TYPO"},
+    ],
+)
+def test_invalid_vertex_shape_cannot_produce_a_create_plan(bounded_plan, changes):
+    with pytest.raises(VertexJobObservationError):
+        replace(bounded_plan, **changes)
+
+
+def test_vertex_deadlines_use_elapsed_time_across_both_daylight_saving_changes(bounded_plan):
+    denver = ZoneInfo("America/Denver")
+    with pytest.raises(VertexJobObservationError, match="cannot fit"):
+        replace(
+            bounded_plan,
+            submit_before=datetime(2026, 3, 8, 1, 30, tzinfo=denver),
+            hard_deadline=datetime(2026, 3, 8, 3, 30, tzinfo=denver),
+            max_run_seconds=5400,
+        )
+    repeated_hour = replace(
+        bounded_plan,
+        submit_before=datetime(2026, 11, 1, 1, 40, tzinfo=denver, fold=0),
+        hard_deadline=datetime(2026, 11, 1, 3, tzinfo=denver),
+    )
+    with pytest.raises(VertexJobObservationError, match="window has elapsed"):
+        repeated_hour.create_payload(now=datetime(2026, 11, 1, 1, 10, tzinfo=denver, fold=1))

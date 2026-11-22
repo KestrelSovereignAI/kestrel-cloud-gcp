@@ -14,6 +14,17 @@ VERTEX_OPERATION_LABEL = "kestrel_operation_sha256"
 _NUMBER = re.compile(r"[1-9][0-9]{0,19}")
 _US_REGION = re.compile(r"us-[a-z]+[0-9]+")
 _SHA256 = re.compile(r"[a-f0-9]{64}")
+_MACHINE = re.compile(r"[a-z][a-z0-9-]{1,62}")
+# Reviewed single-worker options from Vertex v1 AcceleratorType; machine
+# compatibility and quota remain an operator/catalog admission check.
+_ACCELERATORS = frozenset({"NVIDIA_TESLA_T4", "NVIDIA_L4", "NVIDIA_TESLA_A100", "NVIDIA_A100_80GB"})
+_SERVICE_ACCOUNT = re.compile(
+    r"[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com"
+)
+_IMAGE_PATH = re.compile(
+    r"[a-z][a-z0-9-]{4,28}[a-z0-9]/[a-z0-9][a-z0-9_-]*/"
+    r"(?:[a-z0-9][a-z0-9_.-]*/)*[a-z0-9][a-z0-9_.-]*@sha256:[a-f0-9]{64}"
+)
 _RFC3339 = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.(?P<fraction>[0-9]{1,9}))?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])"
@@ -108,6 +119,99 @@ def vertex_operation_label_value(operation_sha256: str) -> str:
     if not isinstance(operation_sha256, str) or not _SHA256.fullmatch(operation_sha256):
         raise VertexJobObservationError("Invalid original Vertex operation digest")
     return b32encode(bytes.fromhex(operation_sha256)).decode("ascii").rstrip("=").lower()
+
+
+@dataclass(frozen=True, slots=True)
+class VertexCustomJobPlan:
+    """A single regional GPU container plan, not authorization to submit it."""
+
+    location: VertexCustomJobLocation
+    operation_sha256: str
+    worker_service_account: str
+    image_uri: str
+    machine_type: str
+    accelerator_type: str
+    max_run_seconds: int
+    submit_before: datetime
+    hard_deadline: datetime
+
+    def __post_init__(self) -> None:
+        vertex_operation_label_value(self.operation_sha256)
+        if not isinstance(self.location, VertexCustomJobLocation) or isinstance(
+            self.location, VertexCustomJobLocator
+        ):
+            raise VertexJobObservationError("Vertex plan requires a collection location")
+        prefix = f"{self.location.region}-docker.pkg.dev/"
+        if (
+            not isinstance(self.image_uri, str) or not self.image_uri.startswith(prefix)
+            or _IMAGE_PATH.fullmatch(self.image_uri[len(prefix):]) is None
+        ):
+            raise VertexJobObservationError("Vertex plan requires a colocated digest-pinned image")
+        for value, pattern in (
+            (self.worker_service_account, _SERVICE_ACCOUNT),
+            (self.machine_type, _MACHINE),
+        ):
+            if not isinstance(value, str) or pattern.fullmatch(value) is None:
+                raise VertexJobObservationError("Invalid Vertex workload identity or machine shape")
+        if not isinstance(self.accelerator_type, str) or self.accelerator_type not in _ACCELERATORS:
+            raise VertexJobObservationError("Vertex GPU type is outside the reviewed v1 set")
+        if type(self.max_run_seconds) is not int or self.max_run_seconds < 1:
+            raise VertexJobObservationError("Vertex job requires a positive runtime limit")
+        for name in ("submit_before", "hard_deadline"):
+            deadline = getattr(self, name)
+            if not isinstance(deadline, datetime) or deadline.utcoffset() is None:
+                raise VertexJobObservationError("Vertex plan deadlines must be timezone-aware")
+            object.__setattr__(self, name, deadline.astimezone(UTC))
+        if (self.hard_deadline - self.submit_before).total_seconds() < self.max_run_seconds:
+            raise VertexJobObservationError("Vertex runtime cannot fit into the original admission")
+
+    @property
+    def create_url(self) -> str:
+        return self.location.list_url
+
+    def create_payload(self, *, now: datetime) -> dict[str, Any]:
+        """Encode a request before POST without sending it or retaining secrets.
+
+        Vertex's runtime timeout does not bound queue time. The caller remains
+        responsible for the absolute deadline, including cancellation in queue.
+        """
+        if (
+            not isinstance(now, datetime) or now.utcoffset() is None
+            or now.astimezone(UTC) >= self.submit_before
+        ):
+            raise VertexJobObservationError("Vertex submission window has elapsed")
+        label = vertex_operation_label_value(self.operation_sha256)
+        return {
+            "displayName": "kestrel-" + label,
+            "labels": {VERTEX_OPERATION_LABEL: label},
+            "jobSpec": {
+                "serviceAccount": self.worker_service_account,
+                "enableWebAccess": False,
+                "enableDashboardAccess": False,
+                "scheduling": {
+                    "timeout": f"{self.max_run_seconds}s", "disableRetries": True,
+                    "restartJobOnWorkerRestart": False,
+                },
+                "workerPoolSpecs": [{
+                    "replicaCount": "1",
+                    "machineSpec": {
+                        "machineType": self.machine_type,
+                        "acceleratorType": self.accelerator_type,
+                        "acceleratorCount": 1,
+                    },
+                    "containerSpec": {"imageUri": self.image_uri},
+                }],
+            },
+        }
+
+    def observe_create_response(self, payload: Mapping[str, Any]) -> VertexCustomJobObservation:
+        """Bind one ack; a bad/missing ack is unresolved, never safe to replay."""
+        if not isinstance(payload, Mapping):
+            raise VertexJobObservationError("Invalid Vertex create response")
+        return VertexCustomJobObservation.from_readback(
+            payload, locator=self.location.identify(payload.get("name")),
+            expected_operation_sha256=self.operation_sha256,
+        )
 
 
 @dataclass(frozen=True, slots=True)

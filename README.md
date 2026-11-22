@@ -43,6 +43,13 @@ repeat submission. Verify subsequent status with the exact job URL and
 `VertexCustomJobObservation.from_readback`. The helpers do not submit or cancel
 jobs and never retain trainer arguments or artifacts.
 
+`VertexCustomJobPlan` prepares the US v1 request for one GPU container
+without sending it. The image must be digest-pinned in regional Artifact
+Registry, the worker must have an explicit workload service account, and
+the runtime limit and last submission time must fit its admission deadline.
+The runtime limit does not bound time spent queued; the caller must own
+absolute-deadline cancellation. This class does not call create or cancel.
+
 ## Dependencies
 
 - `kestrel-sovereign-sdk>=0.2,<1` — base `Feature`, `tool`, `ToolCategory`, `BackendType` interfaces
