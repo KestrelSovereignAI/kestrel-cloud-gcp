@@ -57,6 +57,11 @@ Registry, the worker must have an explicit workload service account, and
 the runtime limit and last submission time must fit its admission deadline.
 The runtime limit does not bound time spent queued; the caller must own
 absolute-deadline cancellation. This class does not call create or cancel.
+The container receives one derived environment value,
+`KESTREL_VERTEX_OPERATION_SHA256`, matching the original digest encoded in
+the management label. It is a correlation key only, never proof of identity
+or authorization to fetch artifacts. The job plan accepts no ambient worker
+environment, custom arguments, or user artifact credentials.
 
 ## Dependencies
 

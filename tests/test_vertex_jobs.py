@@ -16,6 +16,7 @@ from google.auth.credentials import Credentials
 from requests.adapters import HTTPAdapter
 
 from kestrel_cloud_gcp.vertex_jobs import (
+    VERTEX_OPERATION_ENV,
     VERTEX_OPERATION_LABEL,
     VertexCustomJobClient,
     VertexCustomJobLocation,
@@ -368,6 +369,19 @@ def test_vertex_cancel_skips_terminal_jobs_and_refuses_foreign_readback(vertex_w
     assert len(calls) == 1 and calls[0][0] == "GET"
 
 
+def test_worker_operation_correlation_matches_the_original_management_label(bounded_plan):
+    original = "0123456789abcdef" * 4
+    plan = replace(bounded_plan, operation_sha256=original)
+    now = plan.submit_before - timedelta(seconds=1)
+    payload = plan.create_payload(now=now)
+    env = payload["jobSpec"]["workerPoolSpecs"][0]["containerSpec"]["env"]
+    label = payload["labels"][VERTEX_OPERATION_LABEL]
+    assert env == [{"name": VERTEX_OPERATION_ENV, "value": original}]
+    assert b32decode(label.upper() + "=" * (-len(label) % 8)).hex() == env[0]["value"]
+    env[0]["value"] = "mutated"
+    assert plan.create_payload(now=now)["jobSpec"]["workerPoolSpecs"][0]["containerSpec"]["env"][0]["value"] == original
+
+
 def test_create_payload_has_one_pinned_worker_explicit_deadline_and_no_ambient_credentials(bounded_plan):
     now = bounded_plan.submit_before - timedelta(seconds=1)
     wire = bounded_plan.create_payload(now=now)
@@ -385,7 +399,10 @@ def test_create_payload_has_one_pinned_worker_explicit_deadline_and_no_ambient_c
                 "machineType": "g2-standard-8", "acceleratorType": "NVIDIA_L4",
                 "acceleratorCount": 1,
             },
-            "containerSpec": {"imageUri": bounded_plan.image_uri},
+            "containerSpec": {
+                "imageUri": bounded_plan.image_uri,
+                "env": [{"name": "KESTREL_VERTEX_OPERATION_SHA256", "value": DIGEST}],
+            },
         }],
     }
     wire["jobSpec"]["workerPoolSpecs"].clear()
