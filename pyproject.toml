@@ -41,6 +41,8 @@ dependencies = [
     "kestrel-sovereign>=0.13.1,<1",
     "google-cloud-compute>=1.15.0",
     "google-cloud-logging>=3.5.0",
+    "google-auth>=2.0.0,<3",
+    "requests>=2.32.0,<3",
 ]
 
 [project.optional-dependencies]

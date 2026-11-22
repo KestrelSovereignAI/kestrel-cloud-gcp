@@ -5,16 +5,26 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import json
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Event, Thread
+from urllib.parse import urlsplit
+
 import pytest
+from google.auth.credentials import Credentials
+from requests.adapters import HTTPAdapter
 
 from kestrel_cloud_gcp.vertex_jobs import (
     VERTEX_OPERATION_LABEL,
+    VertexCustomJobClient,
     VertexCustomJobLocation,
     VertexCustomJobLocator,
     VertexCustomJobObservation,
     VertexCustomJobPlan,
     VertexCustomJobState,
     VertexJobObservationError,
+    VertexJobEffectUnresolvedError,
     find_vertex_custom_job,
     vertex_operation_label_value,
 )
@@ -212,6 +222,150 @@ def bounded_plan():
         max_run_seconds=1800, submit_before=now + timedelta(seconds=60),
         hard_deadline=now + timedelta(seconds=3600),
     )
+
+
+@pytest.fixture
+def vertex_wire():
+    expected = deque()
+    calls = []
+
+    class ProviderHandler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def receive(self):
+            request_data = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            assert self.headers.get("Authorization") == "Bearer loopback-integration-only"
+            calls.append((
+                self.command, self.path, json.loads(request_data) if request_data else None,
+            ))
+            status, payload, headers = expected.popleft()
+            self.send_response(status)
+            for name, value in headers.items():
+                self.send_header(name, value)
+            self.end_headers()
+            self.wfile.write(json.dumps(payload).encode())
+
+        do_GET = do_POST = receive
+
+    class Credential(Credentials):
+        def __init__(self):
+            super().__init__()
+            self.token = "loopback-integration-only"
+            self.refresh_calls = 0
+            self.refresh_delay = 0
+
+        def refresh(self, request):
+            self.refresh_calls += 1
+            Event().wait(self.refresh_delay)
+            self.token = "loopback-integration-only"
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), ProviderHandler) as server:
+        thread = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
+        thread.start()
+
+        class Loopback(HTTPAdapter):
+            def send(self, request, **kwargs):
+                original = urlsplit(request.url)
+                assert original.netloc == "us-central1-aiplatform.googleapis.com"
+                request.url = f"http://127.0.0.1:{server.server_port}{original.path}"
+                if original.query:
+                    request.url += "?" + original.query
+                return super().send(request, **kwargs)
+
+        def respond(status, payload, **headers):
+            expected.append((status, payload, headers))
+
+        credential = Credential()
+        try:
+            with VertexCustomJobClient(credential) as client:
+                client._session.mount("https://us-central1-aiplatform.googleapis.com/", Loopback())
+                yield client, respond, calls, credential
+                assert not expected, "The adapter skipped an expected exact readback"
+        finally:
+            server.shutdown()
+            thread.join(timeout=1)
+
+
+@pytest.mark.parametrize("status", [200, 302, 401, 503])
+def test_vertex_create_sends_once_and_recovers_only_by_label(vertex_wire, bounded_plan, status):
+    client, respond, calls, credential = vertex_wire
+    now = datetime.now(UTC)
+    plan = replace(
+        bounded_plan, submit_before=now + timedelta(minutes=1),
+        hard_deadline=now + timedelta(hours=1),
+    )
+    respond(status, payload(), Location=JOB.get_url)
+    if status == 200:
+        assert client.create(plan).locator == JOB
+    else:
+        with pytest.raises(VertexJobEffectUnresolvedError, match="original operation label"):
+            client.create(plan)
+        respond(200, {})
+        assert client.find(plan.location, plan.operation_sha256) is None
+        assert [m for m, *_ in calls] == ["POST", "GET"]
+    assert calls[0][:2] == ("POST", "/v1/" + LOCATION.collection_name)
+    assert calls[0][2] == plan.create_payload(now=now)
+    assert credential.refresh_calls == 0
+
+
+def test_expired_vertex_plan_reaches_no_transport(vertex_wire, bounded_plan):
+    client, _, calls, _ = vertex_wire
+    now = datetime.now(UTC)
+    elapsed = replace(
+        bounded_plan, submit_before=now - timedelta(seconds=1),
+        hard_deadline=now + timedelta(hours=1),
+    )
+    with pytest.raises(VertexJobObservationError, match="window has elapsed"):
+        client.create(elapsed)
+    assert not calls
+
+
+def test_vertex_plan_rechecks_deadline_after_google_credential_refresh(vertex_wire, bounded_plan):
+    client, _, calls, credential = vertex_wire
+    now = datetime.now(UTC)
+    plan = replace(
+        bounded_plan, submit_before=now + timedelta(milliseconds=100),
+        hard_deadline=now + timedelta(hours=1),
+    )
+    credential.token = None
+    credential.refresh_delay = 0.15
+    with pytest.raises(VertexJobObservationError, match="window elapsed before transport") as info:
+        client.create(plan)
+    assert not isinstance(info.value, VertexJobEffectUnresolvedError)
+    assert credential.refresh_calls == 1
+    assert not calls
+
+
+@pytest.mark.parametrize("post_status", [200, 503])
+@pytest.mark.parametrize("final_state", ["CANCELLED", "SUCCEEDED", "CANCELLING"])
+def test_vertex_cancel_requires_exact_final_readback(vertex_wire, post_status, final_state):
+    client, respond, calls, _ = vertex_wire
+    respond(200, payload(state="JOB_STATE_RUNNING", endTime=None))
+    respond(post_status, {})
+    end = None if final_state == "CANCELLING" else "2026-11-22T17:06:30Z"
+    respond(200, payload(state="JOB_STATE_" + final_state, endTime=end))
+    if end is None:
+        with pytest.raises(VertexJobEffectUnresolvedError, match="no exact terminal readback"):
+            client.cancel(JOB, DIGEST)
+    else:
+        assert client.cancel(JOB, DIGEST).state is VertexCustomJobState[final_state]
+    assert [method for method, *_ in calls] == ["GET", "POST", "GET"]
+    assert calls[1] == ("POST", f"/v1/{JOB.resource_name}:cancel", {})
+    assert all(urlsplit(path).path == f"/v1/{JOB.resource_name}" for _, path, _ in calls[::2])
+
+
+@pytest.mark.parametrize("terminal", [True, False])
+def test_vertex_cancel_skips_terminal_jobs_and_refuses_foreign_readback(vertex_wire, terminal):
+    client, respond, calls, _ = vertex_wire
+    if terminal:
+        respond(200, payload())
+        assert client.cancel(JOB, DIGEST).state is VertexCustomJobState.SUCCEEDED
+    else:
+        respond(200, payload(labels={}))
+        with pytest.raises(VertexJobObservationError, match="does not bind the original job"):
+            client.cancel(JOB, DIGEST)
+    assert len(calls) == 1 and calls[0][0] == "GET"
 
 
 def test_create_payload_has_one_pinned_worker_explicit_deadline_and_no_ambient_credentials(bounded_plan):
