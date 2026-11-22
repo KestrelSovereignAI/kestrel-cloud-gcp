@@ -7,10 +7,12 @@ import pytest
 
 from kestrel_cloud_gcp.vertex_jobs import (
     VERTEX_OPERATION_LABEL,
+    VertexCustomJobLocation,
     VertexCustomJobLocator,
     VertexCustomJobObservation,
     VertexCustomJobState,
     VertexJobObservationError,
+    find_vertex_custom_job,
     vertex_operation_label_value,
 )
 
@@ -113,3 +115,84 @@ def test_refuses_foreign_job_or_unconfirmed_timeline(overrides):
 def test_only_explicit_us_job_resource_names_are_accepted(address):
     with pytest.raises(VertexJobObservationError):
         VertexCustomJobLocator(*address)
+
+
+LOCATION = VertexCustomJobLocation(JOB.project_number, JOB.region)
+
+
+def test_search_uses_only_exact_regional_list_and_paginates_after_a_match():
+    calls = []
+    pages = iter([
+        {"customJobs": [payload()], "nextPageToken": " opaque-token "},
+        {},
+    ])
+
+    def next_page(url, params):
+        calls.append((url, params))
+        return next(pages)
+
+    assert find_vertex_custom_job(
+        next_page, location=LOCATION, operation_sha256=DIGEST
+    ) == read(payload())
+    initial_query = {
+        "filter": f"labels.{VERTEX_OPERATION_LABEL}={vertex_operation_label_value(DIGEST)}",
+        "fields": "customJobs(name,labels,state,createTime,startTime,endTime),nextPageToken",
+    }
+    regional_url = JOB.get_url.rsplit("/", 1)[0]
+    assert calls == [
+        (regional_url, initial_query),
+        (regional_url, {**initial_query, "pageToken": " opaque-token "}),
+    ]
+
+
+def test_complete_empty_vertex_search_is_not_a_job_observation():
+    assert find_vertex_custom_job(
+        lambda *_: {}, location=LOCATION, operation_sha256=DIGEST
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "pages, limit, problem",
+    [
+        ([{"customJobs": [payload(), payload()]}], 1, "multiple observations"),
+        (
+            [
+                {"customJobs": [payload()], "nextPageToken": "token"},
+                {"customJobs": [payload(name=JOB.resource_name[:-1] + "2")]},
+            ],
+            2,
+            "multiple observations",
+        ),
+        ([{"nextPageToken": "token"}] * 2, 3, "repeated a page token"),
+        ([{"customJobs": [payload()], "nextPageToken": "token"}], 1, "page bound"),
+        ([{"nextPageToken": None}], 1, "Invalid Vertex job list response"),
+        ([{"customJobs": [False]}], 1, "Invalid Vertex job list record"),
+        ([{"customJobs": {}}], 1, "Invalid Vertex job list response"),
+        ([{"error": {}}], 1, "Invalid Vertex job list response"),
+        (
+            [{"customJobs": [payload(name=JOB.resource_name.replace("us-", "europe-"))]}],
+            1,
+            "foreign job",
+        ),
+        ([{"customJobs": [payload(labels={})]}], 1, "does not bind the original job"),
+    ],
+)
+def test_search_does_not_reattach_from_ambiguous_or_unverified_results(pages, limit, problem):
+    responses = iter(pages)
+    with pytest.raises(VertexJobObservationError, match=problem):
+        find_vertex_custom_job(
+            lambda *_: next(responses),
+            location=LOCATION,
+            operation_sha256=DIGEST,
+            max_pages=limit,
+        )
+
+
+def test_vertex_search_rejects_invalid_bounds_before_transport():
+    def forbidden(*_):
+        pytest.fail("Search cannot run with an invalid bound")
+
+    with pytest.raises(ValueError, match="positive page bound"):
+        find_vertex_custom_job(
+            forbidden, location=LOCATION, operation_sha256=DIGEST, max_pages=True
+        )

@@ -32,6 +32,17 @@ prefer_spot = true
 - Standalone API: `GCPComputeEngineManager` for direct programmatic use
 - Spot-instance preference + automatic lifecycle (TTL, budget caps)
 
+### Vertex Custom Job recovery
+
+`kestrel_cloud_gcp.vertex_jobs` offers read-only helpers for US Vertex AI v1
+Custom Jobs. Bind the original dispatch digest with `vertex_operation_label_value`
+and use `find_vertex_custom_job` with an authenticated GET callback to recover
+the exact job after a lost submit response. The search rejects multiple matches,
+foreign identities, and incomplete pages. An empty result never authorizes a
+repeat submission. Verify subsequent status with the exact job URL and
+`VertexCustomJobObservation.from_readback`. The helpers do not submit or cancel
+jobs and never retain trainer arguments or artifacts.
+
 ## Dependencies
 
 - `kestrel-sovereign-sdk>=0.2,<1` — base `Feature`, `tool`, `ToolCategory`, `BackendType` interfaces

@@ -1,10 +1,10 @@
-"""Content-free evidence for an exact Vertex v1 Custom Job readback."""
+"""Content-free readback and recovery evidence for Vertex v1 Custom Jobs."""
 
 from __future__ import annotations
 
 import re
 from base64 import b32encode
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -25,32 +25,53 @@ class VertexJobObservationError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
-class VertexCustomJobLocator:
-    """Exact resource name bound to a configured Google project number."""
+class VertexCustomJobLocation:
+    """Explicit US Vertex Custom Job collection, with no project alias."""
 
     project_number: str
     region: str
-    job_id: str
 
     def __post_init__(self) -> None:
         for value, pattern in (
             (self.project_number, _NUMBER),
             (self.region, _US_REGION),
-            (self.job_id, _NUMBER),
         ):
             if not isinstance(value, str) or not pattern.fullmatch(value):
                 raise VertexJobObservationError("Invalid US Vertex Custom Job locator")
 
     @property
+    def collection_name(self) -> str:
+        return f"projects/{self.project_number}/locations/{self.region}/customJobs"
+
+    @property
+    def list_url(self) -> str:
+        return f"https://{self.region}-aiplatform.googleapis.com/v1/{self.collection_name}"
+
+    def identify(self, resource_name: object) -> VertexCustomJobLocator:
+        prefix = self.collection_name + "/"
+        if not isinstance(resource_name, str) or not resource_name.startswith(prefix):
+            raise VertexJobObservationError("Vertex search returned a foreign job")
+        return VertexCustomJobLocator(self.project_number, self.region, resource_name[len(prefix):])
+
+
+@dataclass(frozen=True, slots=True)
+class VertexCustomJobLocator(VertexCustomJobLocation):
+    """Exact resource name bound to a configured Google project number."""
+
+    job_id: str
+
+    def __post_init__(self) -> None:
+        VertexCustomJobLocation.__post_init__(self)
+        if not isinstance(self.job_id, str) or not _NUMBER.fullmatch(self.job_id):
+            raise VertexJobObservationError("Invalid US Vertex Custom Job locator")
+
+    @property
     def resource_name(self) -> str:
-        return (
-            f"projects/{self.project_number}/locations/{self.region}/"
-            f"customJobs/{self.job_id}"
-        )
+        return f"{self.collection_name}/{self.job_id}"
 
     @property
     def get_url(self) -> str:
-        return f"https://{self.region}-aiplatform.googleapis.com/v1/{self.resource_name}"
+        return f"{self.list_url}/{self.job_id}"
 
 
 class VertexCustomJobState(StrEnum):
@@ -142,6 +163,58 @@ class VertexCustomJobObservation:
             started_at[0] if started_at is not None else None,
             ended_at[0] if ended_at is not None else None,
         )
+
+
+def find_vertex_custom_job(
+    fetch_page: Callable[[str, Mapping[str, str]], Mapping[str, Any]],
+    *,
+    location: VertexCustomJobLocation,
+    operation_sha256: str,
+    max_pages: int = 20,
+) -> VertexCustomJobObservation | None:
+    """Find one exact advertised job through the read-only v1 label filter.
+
+    The authenticated transport is supplied by the caller. A complete empty
+    result describes this observation only, never permission to retry a create
+    after an ambiguous result. Multiple matches or incomplete evidence fail
+    closed. A caller must persist the confirmed job identity before effects.
+    """
+    if type(max_pages) is not int or max_pages < 1:
+        raise ValueError("Vertex search requires a positive page bound")
+    label = vertex_operation_label_value(operation_sha256)
+    query = {
+        "filter": f"labels.{VERTEX_OPERATION_LABEL}={label}",
+        "fields": "customJobs(name,labels,state,createTime,startTime,endTime),nextPageToken",
+    }
+    candidate: VertexCustomJobObservation | None = None
+    seen_tokens: set[str] = set()
+    for _ in range(max_pages):
+        payload = fetch_page(location.list_url, dict(query))
+        if not isinstance(payload, Mapping) or set(payload).difference(
+            {"customJobs", "nextPageToken"}
+        ):
+            raise VertexJobObservationError("Invalid Vertex job list response")
+        rows, token = payload.get("customJobs", []), payload.get("nextPageToken", "")
+        if not isinstance(rows, list) or not isinstance(token, str):
+            raise VertexJobObservationError("Invalid Vertex job list response")
+        for row in rows:
+            if not isinstance(row, Mapping):
+                raise VertexJobObservationError("Invalid Vertex job list record")
+            observation = VertexCustomJobObservation.from_readback(
+                row,
+                locator=location.identify(row.get("name")),
+                expected_operation_sha256=operation_sha256,
+            )
+            if candidate is not None:
+                raise VertexJobObservationError("Vertex search found multiple observations")
+            candidate = observation
+        if not token:
+            return candidate
+        if token in seen_tokens:
+            raise VertexJobObservationError("Vertex search repeated a page token")
+        seen_tokens.add(token)
+        query["pageToken"] = token
+    raise VertexJobObservationError("Vertex search did not complete within its page bound")
 
 
 def _timestamp(value: Any) -> tuple[datetime, int] | None:
