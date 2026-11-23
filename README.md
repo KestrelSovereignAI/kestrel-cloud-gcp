@@ -34,8 +34,9 @@ prefer_spot = true
 
 ### Vertex Custom Job admission and recovery
 
-`kestrel_cloud_gcp.vertex_jobs` offers read-only helpers for US Vertex AI v1
-Custom Jobs. Bind the original dispatch digest with `vertex_operation_label_value`
+Starting in `kestrel-cloud-gcp` 0.3.0, `kestrel_cloud_gcp.vertex_jobs` provides
+US Vertex AI v1 Custom Job submission and recovery. Bind the original dispatch
+digest with `vertex_operation_label_value`
 and use `find_vertex_custom_job` with an authenticated GET callback to recover
 the exact job after a lost submit response. The search rejects multiple matches,
 foreign identities, and incomplete pages. An empty result never authorizes a
@@ -76,6 +77,10 @@ environment, custom arguments, or user artifact credentials.
 uv pip install -e '.[test]'
 uv run pytest
 ```
+
+PyPI releases use an immutable version tag on `main`. Tag CI verifies the
+version and installs the same wheel that it hands to the trusted-publishing
+job, together with its source distribution. It does not rebuild after CI.
 
 ## License
 
