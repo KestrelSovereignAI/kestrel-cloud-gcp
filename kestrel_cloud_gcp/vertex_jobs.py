@@ -19,6 +19,8 @@ _NUMBER = re.compile(r"[1-9][0-9]{0,19}")
 _US_REGION = re.compile(r"us-[a-z]+[0-9]+")
 _SHA256 = re.compile(r"[a-f0-9]{64}")
 _MACHINE = re.compile(r"[a-z][a-z0-9-]{1,62}")
+_GCS_BUCKET = re.compile(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]")
+_DNS_HOST = re.compile(r"(?:[a-z][a-z0-9-]{0,61}[a-z0-9]?\.)+[a-z]{2,63}")
 # Reviewed single-worker options from Vertex v1 AcceleratorType; machine
 # compatibility and quota remain an operator/catalog admission check.
 _ACCELERATORS = frozenset({"NVIDIA_TESLA_T4", "NVIDIA_L4", "NVIDIA_TESLA_A100", "NVIDIA_A100_80GB"})
@@ -126,6 +128,19 @@ def vertex_operation_label_value(operation_sha256: str) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class VertexWorkerDispatch:
+    """Non-secret rendezvous settings for a preauthorized one-shot workload."""
+
+    bucket: str
+    artifact_gateway_host: str
+
+    def __post_init__(self) -> None:
+        for value, pattern in ((self.bucket, _GCS_BUCKET), (self.artifact_gateway_host, _DNS_HOST)):
+            if not isinstance(value, str) or len(value) > 253 or pattern.fullmatch(value) is None:
+                raise VertexJobObservationError("Invalid Vertex worker dispatch location")
+
+
+@dataclass(frozen=True, slots=True)
 class VertexCustomJobPlan:
     """A single regional GPU container plan, not authorization to submit it."""
 
@@ -138,6 +153,7 @@ class VertexCustomJobPlan:
     max_run_seconds: int
     submit_before: datetime
     hard_deadline: datetime
+    worker_dispatch: VertexWorkerDispatch | None = None
 
     def __post_init__(self) -> None:
         vertex_operation_label_value(self.operation_sha256)
@@ -168,10 +184,26 @@ class VertexCustomJobPlan:
             object.__setattr__(self, name, deadline.astimezone(UTC))
         if (self.hard_deadline - self.submit_before).total_seconds() < self.max_run_seconds:
             raise VertexJobObservationError("Vertex runtime cannot fit into the original admission")
+        if self.worker_dispatch is not None and not isinstance(self.worker_dispatch, VertexWorkerDispatch):
+            raise VertexJobObservationError("Vertex dispatch settings must be explicit and typed")
 
     @property
     def create_url(self) -> str:
         return self.location.list_url
+
+    def _worker_env(self) -> list[dict[str, str]]:
+        # The operation is a correlation value, never a credential. All
+        # mutable/private capabilities are delivered after exact readback.
+        values = {VERTEX_OPERATION_ENV: self.operation_sha256}
+        if self.worker_dispatch is not None:
+            values.update({
+                "KESTREL_VERTEX_JOB_COLLECTION": self.location.collection_name,
+                "KESTREL_VERTEX_DISPATCH_BUCKET": self.worker_dispatch.bucket,
+                "KESTREL_VERTEX_HARD_DEADLINE": self.hard_deadline.isoformat(),
+                "CONTAINER_DIGEST": self.image_uri.rsplit("@", 1)[1],
+                "CATALOG_ARTIFACT_HOSTS": "storage.googleapis.com," + self.worker_dispatch.artifact_gateway_host,
+            })
+        return [{"name": name, "value": value} for name, value in values.items()]
 
     def create_payload(self, *, now: datetime) -> dict[str, Any]:
         """Encode a request before POST without sending it or retaining secrets.
@@ -195,6 +227,7 @@ class VertexCustomJobPlan:
                 "scheduling": {
                     "timeout": f"{self.max_run_seconds}s", "disableRetries": True,
                     "restartJobOnWorkerRestart": False,
+                    **({"strategy": "STANDARD"} if self.worker_dispatch is not None else {}),
                 },
                 "workerPoolSpecs": [{
                     "replicaCount": "1",
@@ -205,9 +238,7 @@ class VertexCustomJobPlan:
                     },
                     "containerSpec": {
                         "imageUri": self.image_uri,
-                        # The same digest as the management label, in its
-                        # original representation. It is not a bearer grant.
-                        "env": [{"name": VERTEX_OPERATION_ENV, "value": self.operation_sha256}],
+                        "env": self._worker_env(),
                     },
                 }],
             },
@@ -221,6 +252,55 @@ class VertexCustomJobPlan:
             payload, locator=self.location.identify(payload.get("name")),
             expected_operation_sha256=self.operation_sha256,
         )
+
+    def verify_worker_readback(
+        self, payload: Mapping[str, Any], locator: VertexCustomJobLocator,
+    ) -> VertexCustomJobObservation:
+        """Verify the effect's deployed worker spec before releasing an admission."""
+        if self.worker_dispatch is None or locator.collection_name != self.location.collection_name:
+            raise VertexJobObservationError("A worker admission requires the original explicit dispatch plan")
+        observation = VertexCustomJobObservation.from_readback(
+            payload, locator=locator, expected_operation_sha256=self.operation_sha256,
+        )
+        spec = payload.get("jobSpec")
+        if not isinstance(spec, Mapping):
+            raise VertexJobObservationError("Vertex worker readback lacks its job spec")
+        pools, schedule = spec.get("workerPoolSpecs"), spec.get("scheduling")
+        if (
+            spec.get("serviceAccount") != self.worker_service_account
+            or spec.get("enableWebAccess", False) is not False
+            or spec.get("enableDashboardAccess", False) is not False
+            or spec.get("persistentResourceId", "")
+            or spec.get("network", "")
+            or spec.get("reservedIpRanges", [])
+            or spec.get("pscInterfaceConfig")
+            or not isinstance(schedule, Mapping)
+            or schedule.get("timeout") != f"{self.max_run_seconds}s"
+            or schedule.get("strategy") != "STANDARD"
+            or schedule.get("disableRetries") is not True
+            or schedule.get("restartJobOnWorkerRestart", False) is not False
+            or not isinstance(pools, list) or len(pools) != 1 or not isinstance(pools[0], Mapping)
+        ):
+            raise VertexJobObservationError("Vertex worker readback changed its identity or lifetime policy")
+        pool = pools[0]
+        machine, container = pool.get("machineSpec"), pool.get("containerSpec")
+        replicas = pool.get("replicaCount")
+        if (
+            not (replicas == "1" or (type(replicas) is int and replicas == 1))
+            or not isinstance(machine, Mapping)
+            or machine.get("machineType") != self.machine_type
+            or machine.get("acceleratorType") != self.accelerator_type
+            or type(machine.get("acceleratorCount")) is not int or machine["acceleratorCount"] != 1
+            or not isinstance(container, Mapping)
+            or container.get("imageUri") != self.image_uri
+            or container.get("command", []) != [] or container.get("args", []) != []
+        ):
+            raise VertexJobObservationError("Vertex worker readback changed its pinned single GPU container")
+        expected = self._worker_env()
+        env = container.get("env")
+        if not isinstance(env, list) or len(env) != len(expected) or any(item not in env for item in expected):
+            raise VertexJobObservationError("Vertex worker readback changed its dispatch rendezvous")
+        return observation
 
 
 @dataclass(frozen=True, slots=True)
@@ -441,6 +521,23 @@ class VertexCustomJobClient:
         return VertexCustomJobObservation.from_readback(
             payload, locator=locator, expected_operation_sha256=operation_sha256,
         )
+
+    def get_for_worker_dispatch(
+        self, locator: VertexCustomJobLocator, plan: VertexCustomJobPlan,
+    ) -> VertexCustomJobObservation:
+        """Read only the planned worker fields, exposing no raw spec or credentials."""
+        if plan.worker_dispatch is None or locator.collection_name != plan.location.collection_name:
+            raise VertexJobObservationError("Vertex worker dispatch does not match its original location")
+        fields = (
+            "name,labels,state,createTime,startTime,endTime,"
+            "jobSpec(serviceAccount,enableWebAccess,enableDashboardAccess,persistentResourceId,network,reservedIpRanges,pscInterfaceConfig,"
+            "scheduling(timeout,disableRetries,restartJobOnWorkerRestart,strategy),"
+            "workerPoolSpecs(replicaCount,machineSpec(machineType,acceleratorType,acceleratorCount),"
+            "containerSpec(imageUri,command,args,env)))"
+        )
+        return plan.verify_worker_readback(self._request(
+            "GET", locator.get_url, params={"fields": fields},
+        ), locator)
 
     def cancel(
         self, locator: VertexCustomJobLocator, operation_sha256: str,
