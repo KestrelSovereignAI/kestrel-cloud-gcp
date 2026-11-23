@@ -26,6 +26,7 @@ from kestrel_cloud_gcp.vertex_jobs import (
     VertexCustomJobState,
     VertexJobObservationError,
     VertexJobEffectUnresolvedError,
+    VertexWorkerDispatch,
     find_vertex_custom_job,
     vertex_operation_label_value,
 )
@@ -286,6 +287,72 @@ def vertex_wire():
         finally:
             server.shutdown()
             thread.join(timeout=1)
+
+
+def test_worker_rendezvous_uses_only_fixed_nonsecret_environment(vertex_wire, bounded_plan):
+    client, respond, calls, _ = vertex_wire
+    plan = replace(bounded_plan, worker_dispatch=VertexWorkerDispatch("private-test-bucket", "vault.example.test"))
+    spec = plan.create_payload(now=plan.submit_before - timedelta(seconds=1))["jobSpec"]
+    env = spec["workerPoolSpecs"][0]["containerSpec"]["env"]
+    assert dict((item["name"], item["value"]) for item in env) == {
+        VERTEX_OPERATION_ENV: DIGEST,
+        "CATALOG_ARTIFACT_HOSTS": "storage.googleapis.com,vault.example.test",
+        "CONTAINER_DIGEST": "sha256:" + "a" * 64,
+        "KESTREL_VERTEX_DISPATCH_BUCKET": "private-test-bucket",
+        "KESTREL_VERTEX_HARD_DEADLINE": plan.hard_deadline.isoformat(),
+        "KESTREL_VERTEX_JOB_COLLECTION": LOCATION.collection_name,
+    }
+    respond(200, payload(jobSpec=spec))
+    assert client.get_for_worker_dispatch(JOB, plan) == read(payload())
+    assert calls[0][0] == "GET"
+    assert "workerPoolSpecs" in calls[0][1]
+
+
+@pytest.mark.parametrize("drift", [
+    "user", "gpu", "image", "count", "command", "env", "retries", "persistent",
+    "network", "reserved", "psc", "strategy",
+])
+def test_refuses_worker_release_if_exact_deployed_spec_drifts(bounded_plan, drift):
+    plan = replace(bounded_plan, worker_dispatch=VertexWorkerDispatch("private-test-bucket", "vault.example.test"))
+    spec = plan.create_payload(now=plan.submit_before - timedelta(seconds=1))["jobSpec"]
+    pool = spec["workerPoolSpecs"][0]
+    if drift == "user":
+        spec["serviceAccount"] = "wrong@training-project.iam.gserviceaccount.com"
+    elif drift == "persistent":
+        spec["persistentResourceId"] = "foreign"
+    elif drift == "network":
+        spec["network"] = "projects/123/global/networks/foreign"
+    elif drift == "reserved":
+        spec["reservedIpRanges"] = ["foreign"]
+    elif drift == "psc":
+        spec["pscInterfaceConfig"] = {"networkAttachment": "foreign"}
+    elif drift == "strategy":
+        spec["scheduling"]["strategy"] = "SPOT"
+    elif drift == "gpu":
+        pool["machineSpec"]["acceleratorType"] = "NVIDIA_TESLA_A100"
+    elif drift == "count":
+        pool["replicaCount"] = "2"
+    elif drift == "retries":
+        spec["scheduling"]["disableRetries"] = False
+    elif drift == "image":
+        pool["containerSpec"]["imageUri"] = "different"
+    elif drift == "command":
+        pool["containerSpec"]["command"] = ["python", "other.py"]
+    else:
+        pool["containerSpec"]["env"].append({"name": "not-approved", "value": "no"})
+    with pytest.raises(VertexJobObservationError, match="changed"):
+        plan.verify_worker_readback(payload(jobSpec=spec), JOB)
+
+
+@pytest.mark.parametrize("bucket,host", [
+    ("gs://foreign", "vault.example.test"),
+    ("valid-bucket", "https://vault.example.test"),
+    ("valid-bucket", "user@vault.example.test"),
+    ("valid-bucket", "127.0.0.1"),
+])
+def test_rejects_untrusted_dispatch_location_shapes(bucket, host):
+    with pytest.raises(VertexJobObservationError, match="dispatch location"):
+        VertexWorkerDispatch(bucket, host)
 
 
 @pytest.mark.parametrize("status", [200, 302, 401, 503])
