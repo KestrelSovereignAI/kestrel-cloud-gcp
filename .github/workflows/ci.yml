@@ -52,6 +52,9 @@ jobs:
     needs: lint-and-imports
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
@@ -60,6 +63,14 @@ jobs:
 
       - name: Set up Python
         run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Verify the release tag and main ancestry
+        if: github.ref_type == 'tag'
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          git merge-base --is-ancestor HEAD refs/remotes/origin/main
+          PKG_VERSION=$(uv run --no-project --python "$PYTHON_VERSION" python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')
+          test "${GITHUB_REF_NAME#v}" = "$PKG_VERSION"
 
       - name: Build sdist + wheel
         run: uv build
@@ -83,6 +94,7 @@ jobs:
               'kestrel_cloud_gcp/compute/feature.py',
               'kestrel_cloud_gcp/compute/manager.py',
               'kestrel_cloud_gcp/compute/core.py',
+              'kestrel_cloud_gcp/vertex_jobs.py',
           ]
           missing = [m for m in required if m not in names]
           if missing:
@@ -90,6 +102,13 @@ jobs:
               sys.exit(1)
           print(f'Wheel OK ({len(names)} entries)')
           "
+
+      - name: Upload the inspected distributions
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gcp-distributions-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
 
   install-check:
     runs-on: ubuntu-latest
@@ -108,13 +127,20 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
+      - name: Download the inspected distributions
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: gcp-distributions-${{ github.sha }}
+          path: dist/
+
       - name: Clean install + smoke test
         run: |
           uv venv --python ${{ matrix.python-version }} .venv-test
           . .venv-test/bin/activate
-          uv pip install .
-          python -c "
+          uv pip install dist/*.whl
+          python -I -c "
           from kestrel_cloud_gcp import GCPComputeFeature
+          from kestrel_cloud_gcp.vertex_jobs import VertexCustomJobClient, VertexCustomJobPlan, VertexWorkerDispatch
           from kestrel_sdk.features.base import Feature
           from kestrel_sdk.llm import BackendType
           assert issubclass(GCPComputeFeature, Feature)
@@ -122,6 +148,10 @@ jobs:
           eps = md.entry_points(group='kestrel_sovereign.features')
           names = [e.name for e in eps]
           assert 'GCPComputeFeature' in names, f'Entry-point not registered: {names}'
+          assert callable(VertexCustomJobClient.from_adc)
+          assert callable(VertexCustomJobPlan.verify_worker_readback)
+          assert callable(VertexCustomJobClient.get_for_worker_dispatch)
+          assert VertexWorkerDispatch.__module__ == 'kestrel_cloud_gcp.vertex_jobs'
           print(f'kestrel-cloud-gcp installs + entry-point OK on Python ${{ matrix.python-version }}')
           "
 

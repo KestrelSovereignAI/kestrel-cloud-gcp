@@ -1,6 +1,6 @@
 [project]
 name = "kestrel-cloud-gcp"
-version = "0.2.1"
+version = "0.3.0"
 description = "GCP Compute Engine provider for Kestrel Sovereign — provision GPU instances, run training jobs, lifecycle management"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
